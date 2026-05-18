@@ -36,46 +36,6 @@ struct TimedTask : public Task {
     }
 };
 
-class SimpleEventLoop {
-public:
-    auto post(Fn fn) -> TaskHandle {
-        auto h = std::make_shared<TaskState>();
-        m_tasks.push(Task{h, std::move(fn)});
-        return h;
-    }
-    auto postDelayed(Delay delay, Fn fn) -> TaskHandle {
-        auto h = std::make_shared<TaskState>();
-        m_timedTasks.push(TimedTask{h, std::move(fn), Clock::now() + delay});
-        return h;
-    }
-    void run() {
-        while (!m_tasks.empty() || !m_timedTasks.empty()) {
-            if (!m_timedTasks.empty() && m_timedTasks.top().executeAt <= Clock::now()) {
-                Task task = m_timedTasks.top();
-                m_timedTasks.pop();
-                m_tasks.push(std::move(task));
-            } else if (!m_tasks.empty()) {
-                auto task = m_tasks.front();
-                m_tasks.pop();
-                if (!task.handle->isCancelled()) {
-                    try {
-                        task.fn();
-                    }  catch (const std::exception& e) {
-                        std::cerr << "Exception during task execution: " << e.what() << '\n';
-                    } catch(...) {
-                        std::cerr << "Unkown exception during task execution\n";
-                    }
-                }
-            } else {
-                std::this_thread::sleep_until(m_timedTasks.top().executeAt);
-            }
-        }
-    }
-private:
-    std::queue<Task> m_tasks;
-    std::priority_queue<TimedTask, std::vector<TimedTask>, std::greater<>> m_timedTasks;
-};
-
 class EventLoop {
 public:
     auto post(Fn fn) -> TaskHandle {
@@ -85,12 +45,21 @@ public:
         m_cv.notify_one();
         return h;
     }
-    auto postDelayed(Delay delay, Fn fn) -> TaskHandle {
+    auto post(Delay delay, Fn fn) -> TaskHandle {
         std::lock_guard<std::mutex> guard(m_mtx);
         auto h = std::make_shared<TaskState>();
         m_timedTasks.push(TimedTask{h, std::move(fn), Clock::now() + delay});
         m_cv.notify_one();
         return h;
+    }
+    auto flush() {
+        std::lock_guard<std::mutex> guard(m_mtx);
+        while (!m_tasks.empty()) {
+            m_tasks.pop();
+        }
+        while (!m_timedTasks.empty()) {
+            m_timedTasks.pop();
+        }
     }
     void run() {
         std::unique_lock<std::mutex> lock(m_mtx);
@@ -129,8 +98,8 @@ public:
         m_cv.notify_all();
     }
 private:
-    std::mutex m_mtx;
     std::condition_variable m_cv;
+    std::mutex m_mtx;
     std::atomic_bool m_running = false;
     std::queue<Task> m_tasks;
     std::priority_queue<TimedTask, std::vector<TimedTask>, std::greater<>> m_timedTasks;
@@ -138,9 +107,13 @@ private:
 
 } // namespace async
 
-class TestSimpleEventLoop : public testing::Test {
+class TestEventLoop : public testing::Test {
 public:
-    void check(size_t val) {
+};
+
+class Counter {
+public:
+    auto check(size_t val) {
         ASSERT_EQ(val, m_val);
         ++m_val;
     }
@@ -148,68 +121,143 @@ private:
     size_t m_val = 1;
 };
 
-TEST_F(TestSimpleEventLoop, Example1) {
+TEST_F(TestEventLoop, PostTasks) {
     using namespace async;
-
-    SimpleEventLoop loop;
-
-    loop.post([this, &loop]() {
-        check(1);
-        loop.post([this]() {
-            check(3);
-        });
+    EventLoop loop;
+    auto counter = std::make_shared<Counter>();
+    loop.post([counter] {
+        counter->check(1);
     });
-
-    loop.post([this]() {
-        check(2);
+    loop.post([counter] {
+        counter->check(2);
     });
-
-    auto h1 = loop.post([this]() {
-        check(999);
+    loop.post([counter] {
+        counter->check(3);
     });
-    h1->cancel();
-
-    loop.postDelayed(Delay{5}, [this]() {
-        check(4);
+    loop.post([&loop] {
+        loop.stop();
     });
-
     loop.run();
+    counter->check(4);
 }
 
-class TestEventLoop : public testing::Test {
-public:
-};
+TEST_F(TestEventLoop, PostNestedTasks) {
+    using namespace async;
+    EventLoop loop;
+    auto counter = std::make_shared<Counter>();
+    loop.post([counter, &loop] {
+        loop.post([counter, &loop] {
+            counter->check(3);
+            loop.stop();
+        });
+        counter->check(1);
+    });
+    loop.post([counter] {
+        counter->check(2);
+    });
+    loop.run();
+    counter->check(4);
+}
+
+TEST_F(TestEventLoop, PostDelayedTasks) {
+    using namespace async;
+    EventLoop loop;
+    auto counter = std::make_shared<Counter>();
+    loop.post(std::chrono::milliseconds(10), [counter] {
+        counter->check(2);
+    });
+    loop.post(std::chrono::milliseconds(15), [counter, &loop] {
+        counter->check(3);
+        loop.stop();
+    });
+    loop.post([counter] {
+        counter->check(1);
+    });
+    loop.run();
+    counter->check(4);
+}
+
+TEST_F(TestEventLoop, ThrowExceptionTasks) {
+    using namespace async;
+    EventLoop loop;
+    auto counter = std::make_shared<Counter>();
+    loop.post([counter] {
+        counter->check(1);
+        throw std::runtime_error("just a test error, don't worry");
+    });
+    loop.post([counter, &loop] {
+        counter->check(2);
+        loop.stop();
+    });
+    loop.run();
+    counter->check(3);
+}
+
+TEST_F(TestEventLoop, CancelTasks) {
+    using namespace async;
+    EventLoop loop;
+    auto counter = std::make_shared<Counter>();
+    auto h1 = loop.post([counter] {
+        counter->check(999);
+    });
+    auto h2 = loop.post(std::chrono::milliseconds(10), [counter] {
+        counter->check(999);
+    });
+    loop.post(std::chrono::milliseconds(15), [counter, &loop] {
+        counter->check(1);
+        loop.stop();
+    });
+    h1->cancel();
+    h2->cancel();
+    loop.run();
+    counter->check(2);
+}
 
 TEST_F(TestEventLoop, StopSleepingEventLoop) {
     using namespace async;
-
     EventLoop loop;
-
-    std::thread stopper([&] {
-        std::this_thread::sleep_for(std::chrono::milliseconds(100));
+    std::thread stopper([&loop] {
+        std::this_thread::sleep_for(std::chrono::milliseconds(10));
         loop.stop();
     });
-
-    loop.post([] {
-        std::cout << "started event loop\n";
-    });
     loop.run();
-
     stopper.join();
-    std::cout << "stopped event loop\n";
 }
 
-class Foo : public std::enable_shared_from_this<Foo> {
+TEST_F(TestEventLoop, FlushQueues) {
+    using namespace async;
+    EventLoop loop;
+    auto counter = std::make_shared<Counter>();
+    loop.post([counter, &loop] {
+        loop.flush();
+        counter->check(1);
+    });
+    for (size_t i = 1; i <= 10; ++i) {
+        loop.post([counter] {
+            counter->check(999);
+        });
+    }
+    std::thread stopper([&loop] {
+        std::this_thread::sleep_for(std::chrono::milliseconds(10));
+        loop.stop();
+    });
+    loop.run();
+    stopper.join();
+    counter->check(2);
+}
+
+class ThreadedExecutor : public std::enable_shared_from_this<ThreadedExecutor> {
 public:
-    explicit Foo(std::shared_ptr<async::EventLoop> loop)
-        : m_loop{std::move(loop)} {}
+    static auto create(std::shared_ptr<async::EventLoop> loop) {
+        return std::shared_ptr<ThreadedExecutor>(new ThreadedExecutor(std::move(loop)));
+    }
     void doSomethingLightAsync() {
         m_loop->post([] {
             std::cout << "good day!\n";
         });
     }
     void doSomethingHeavyAsync() {
-        // Foo must be owned by std::shared_ptr for this
+        // ThreadedExecutor must be owned by std::shared_ptr for this
         auto weak = weak_from_this();
         m_loop->post([weak]() {
             std::thread([weak](){
@@ -219,45 +267,27 @@ public:
                 } else {
                     std::cout << "dang!\n";
                 }
-            }).detach();
+            }).detach(); // TODO: consider thread pool instead of detached thread
         });
     }
 private:
+    explicit ThreadedExecutor(std::shared_ptr<async::EventLoop> loop)
+        : m_loop{std::move(loop)} {}
     std::shared_ptr<async::EventLoop> m_loop;
 };
 
-TEST_F(TestEventLoop, ExecuteInThread) {
-    using namespace async;
-
-    auto loop = std::make_shared<EventLoop>();
-    auto foo = std::make_shared<Foo>(loop);
-    foo->doSomethingHeavyAsync();
-
-    std::thread stopper([&] {
-        std::this_thread::sleep_for(std::chrono::milliseconds(250));
-        loop->stop();
-    });
-
-    loop->post([] {
-        std::cout << "started event loop\n";
-    });
-    loop->run();
-
-    stopper.join();
-    std::cout << "stopped event loop\n";
-}
-
+/*
 TEST_F(TestEventLoop, Example1) {
     using namespace async;
 
-    EventLoop loop;
+    auto loop = std::make_shared<EventLoop>();
 
-    std::thread producer([&loop]() {
+    std::thread producer([loop]() {
         for (int i = 1; i <= 5; ++i) {
             std::cout << "Sending event " << i << " from thread "
                       << std::this_thread::get_id()
                       << std::endl;
-            loop.post([i]() {
+            loop->post([i]() {
                 std::cout << "Event " << i
                           << " handled on thread "
                           << std::this_thread::get_id()
@@ -265,9 +295,9 @@ TEST_F(TestEventLoop, Example1) {
             });
             std::this_thread::sleep_for(std::chrono::seconds(1));
         }
-        loop.post([&]() {
+        loop->post([&]() {
             std::cout << "Stopping loop" << std::endl;;
-            loop.stop();
+            loop->stop();
         });
     });
 
@@ -275,7 +305,8 @@ TEST_F(TestEventLoop, Example1) {
               << std::this_thread::get_id()
               << std::endl;;
 
-    loop.run();
+    loop->run();
     producer.join();
     std::cout << "Done" << std::endl;
 }
+*/
