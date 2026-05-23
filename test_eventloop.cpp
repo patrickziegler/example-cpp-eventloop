@@ -29,9 +29,9 @@ struct Task {
     std::function<void()> fn;
 };
 
-struct TimedTask : public Task {
+struct Timer : public Task {
     TimePont executeAt;
-    bool operator>(const TimedTask& other) const {
+    bool operator>(const Timer& other) const {
         return executeAt > other.executeAt;
     }
 };
@@ -48,7 +48,7 @@ public:
     auto post(Delay delay, Fn fn) -> TaskHandle {
         std::lock_guard<std::mutex> guard(m_mtx);
         auto h = std::make_shared<TaskState>();
-        m_timedTasks.push(TimedTask{h, std::move(fn), Clock::now() + delay});
+        m_timers.push(Timer{h, std::move(fn), Clock::now() + delay});
         m_cv.notify_one();
         return h;
     }
@@ -57,8 +57,8 @@ public:
         while (!m_tasks.empty()) {
             m_tasks.pop();
         }
-        while (!m_timedTasks.empty()) {
-            m_timedTasks.pop();
+        while (!m_timers.empty()) {
+            m_timers.pop();
         }
     }
     void run() {
@@ -68,9 +68,9 @@ public:
         }
         m_running = true;
         while (m_running) {
-            if (!m_timedTasks.empty() && m_timedTasks.top().executeAt <= Clock::now()) {
-                Task task = m_timedTasks.top();
-                m_timedTasks.pop();
+            if (!m_timers.empty() && m_timers.top().executeAt <= Clock::now()) {
+                Task task = m_timers.top();
+                m_timers.pop();
                 m_tasks.push(std::move(task));
             } else if (!m_tasks.empty()) {
                 auto task = m_tasks.front();
@@ -86,8 +86,8 @@ public:
                     }
                     lock.lock();
                 }
-            } else if (!m_timedTasks.empty()) {
-                m_cv.wait_until(lock, m_timedTasks.top().executeAt);
+            } else if (!m_timers.empty()) {
+                m_cv.wait_until(lock, m_timers.top().executeAt);
             } else {
                 m_cv.wait(lock);
             }
@@ -102,7 +102,7 @@ private:
     std::mutex m_mtx;
     std::atomic_bool m_running = false;
     std::queue<Task> m_tasks;
-    std::priority_queue<TimedTask, std::vector<TimedTask>, std::greater<>> m_timedTasks;
+    std::priority_queue<Timer, std::vector<Timer>, std::greater<>> m_timers;
 };
 
 } // namespace async
